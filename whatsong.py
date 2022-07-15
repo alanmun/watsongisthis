@@ -113,7 +113,6 @@ def checkForMentions(api):
 		else:
 			#sys.stdout.write('.')
 			#sys.stdout.flush() #No newline on this print
-			print(".")
 			f.close()
 			f = open(workingDir + completedJobs, "a") #Flush to the file in case of sigkill or something else that prevents writes from actually persisting
 			try:
@@ -309,7 +308,7 @@ def shazam (payload=None):
 	except KeyError:
 		print("KEY ERROR: ")
 		print(response)
-		return "I couldn't find anything, sorry :["
+		return "I couldn't find anything, sorry :("
 
 def scrapeStatusForVideo(statusURL):
 	try:
