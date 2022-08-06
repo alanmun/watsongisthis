@@ -15,7 +15,12 @@ from datetime import datetime
 def main():
 
 	#Get the authentication credentials to connect to twitter
-	keysFile = open("keys", 'r')
+	try:
+		keysFile = open("keys", 'r') #Try to assume it is in the cwd
+	except FileNotFoundError as e:
+		print("Couldn't find keys file, falling back to absolute path")
+		keysFile = open("/home/pi/project/whatsong/keys") #Try an absolute path based on where it should be on my Raspberry Pi
+
 	keys = keysFile.read().split('\n')
 	APIKey = keys[0].split('=')[1]
 	APISecretKey = keys[1].split('=')[1]
