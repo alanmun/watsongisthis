@@ -155,7 +155,7 @@ def processMention(api, mention):
 		errorCodes = [136, 144, 63, 34, 179, 50, 433]
 		print("Tweepy error occurred while in someoneNeedsMe:{}".format(e))
 		#Attempt to snatch video url even if original poster blocked us
-		if e.api_code == 136 and ((hasattr(mention, "extended_entities") and mention.extended_entities["media"][0]['type'] == "video") is False): return snatchVideoURL()
+		if e.api_code == 136 and ((hasattr(mention, "extended_entities") and mention.extended_entities["media"][0]['type'] == "video") is False): return snatchVideoURL(mention)
 		if e.api_code in errorCodes: return [-2, mention.id, -2, -2]
 	except AttributeError as e:
 		print(e)
