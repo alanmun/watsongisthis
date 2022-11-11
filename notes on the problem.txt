@@ -1,5 +1,0 @@
-You COULD do this...
-
-https://publish.twitter.com/?hideConversation=on&query=https%3A%2F%2Ftwitter.com%2Fqojte%2Fstatus%2F1459696465572470790&widget=Tweet
-
-replace what is between %2F and &widget=Tweet. Then look for "@watsongisthis" in the innerHTML of an a element that does NOT also contain "Replying to" in the same <a>'s innerHTML.

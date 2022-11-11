@@ -2,4 +2,4 @@
 
 whatsong.py - main script that runs the bot
 
-happycustomers.txt - tracks completed jobs
+rdb.py - bot's interface to redis database

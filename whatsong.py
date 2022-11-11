@@ -9,15 +9,27 @@ import random
 import time
 import re
 import youtube_dl
-from os.path import exists
-from datetime import datetime
+#from os.path import exists #If you see this in the future its safe to delete lol
+from rdb import rdb
+
+"""
+	List of error codes I'm interested in so far:
+
+	144: Tweet was deleted
+	63: User was banned
+	34: Page does not exist (When does this proc vs 144???)
+	136: You have been blocked by the author of this tweet
+	179: You are not authorized to view status (Privated acc?)
+	50: User not found
+	433: User restricted who can reply to the tweet. Extremely rare, but possible even non-maliciously
+"""
 
 def main():
 
 	#Get the authentication credentials to connect to twitter
 	try:
 		keysFile = open("keys", 'r') #Try to assume it is in the cwd
-	except FileNotFoundError as e:
+	except IOError as e:
 		print("Couldn't find keys file, falling back to absolute path")
 		keysFile = open("/home/pi/project/whatsong/keys") #Try an absolute path based on where it should be on my Raspberry Pi
 
@@ -47,7 +59,23 @@ def main():
 			print("Error during authentication")
 			time.sleep(50)
 
-	checkForMentions(api)
+	#Get the previously completed jobs off of redis
+	serviced = rdb.getRawJobs()
+	print("Got raw jobs, length was: ", len(serviced))
+
+	#Main execution loop
+	while(True):
+		try:
+			mentions = getNewMentions(api.mentions_timeline(count=99, tweet_mode="extended"), serviced) #Filter through all mentions to get only potentially valid ones
+		except tweepy.TweepError as e:
+			print("Tweepy error occurred when trying to get my bots mentions:{}".format(e))
+			time.sleep(60)
+			continue
+
+		for mention in mentions: 
+			if handleMention(api, mention, serviced):
+				time.sleep(15) #Wait 15 seconds between jobs, was 30 previously. Don't bother waiting if previous mention flopped
+
 
 def getTimestamp(tweet): #Checks if a timestamp was included and if so, returns it. Otherwise returns None
 	txt = tweet.full_text
@@ -56,122 +84,93 @@ def getTimestamp(tweet): #Checks if a timestamp was included and if so, returns 
 	else:
 		return None
 
-def checkForMentions(api):
-	#Establish working directory, then load in happycustomers
-	workingDir = "/home/pi/project/whatsong/"
-	completedJobs = "happycustomers.txt"
-	if not exists(workingDir + completedJobs):
-		workingDir = "./" #Fallback to current directory as working directory.
-	
-	r = open(workingDir + completedJobs, "r")
-	serviced = r.read().split("\n")
-	r.close()
-	f = open(workingDir + completedJobs, "a")
+#Finish off a job, tweeting it out if shazam found it or if shazam confirmed it couldn't find it. Any other situation like ffmpeg failing -> skip the tweet
+def wrapUpJob(api, askerName, asker, result, serviced):
+	#We always write our job to redis and append it to the in-memory list
+	rdb.writeJob(askerName, str(asker), result)
+	serviced.append(str(asker)) 
+	if result is None: return #Guard against sending a tweet if it failed
 
-	#Build list of potential mentions requesting my help
-	mentions = api.mentions_timeline(count=299, tweet_mode="extended")
-	while True:
-		temp = []
-		for mention in mentions:
-			if str(mention.id) not in serviced and str(mention.id) + "\r" not in serviced: temp.append(mention)
-		mentions = temp
-		vidAndAsker = someoneNeedsMe(api, mentions)
-		if vidAndAsker[0] == -2:
-			print("someoneNeedsMe mention marked as done due to error proc or some other thing (this is intentional!)")
-			serviced.append(str(vidAndAsker[1]))
-			f.write(str(vidAndAsker[1]) + "\n")
-			continue
-		vid = vidAndAsker[0] #Stores whichever tweet id posted the actual video
-		asker = vidAndAsker[1] #Stores whichever tweet id asked for help
-		link = vidAndAsker[2] #Stores whether or not it was a link instead of a video
-		timestamp = vidAndAsker[3] #Stores a timestamp if one was given
-		if vid != -1:
-			try:
-				askerName = api.get_status(asker).user.screen_name
-				goodwav = downloadToGoodWav(api, vid, link, timestamp)
-				if goodwav == -1:
-					f.write(str(asker) + "\n") #Add completed job to file
-					serviced.append(str(asker)) #Add completed job to in memory list
-					#api.update_status("@" + askerName + " Something went wrong while trying to check this video, sorry :C", in_reply_to_status_id=asker)
-				elif goodwav == -2: pass #Something bad happened (at this point most likely a server side issue so try again)
-				else:
-					payload = toBase64(goodwav)
-					result = shazam(payload)
-					print("@" + askerName + " " + result)
-					f.write(str(asker) + "\n") #Add completed job to file
-					serviced.append(str(asker)) #Add completed job to in memory list
-					mentions.remove(api.get_status(asker))
-					try:
-						api.update_status("@" + askerName + " " + result, in_reply_to_status_id=asker)
-					except tweepy.RateLimitError as e:
-						print("Twitter api rate limit reached".format(e))
-						time.sleep(60)
-						api.update_status("@" + askerName + " " + result, in_reply_to_status_id=asker)
-					except tweepy.TweepError as e:
-						if e.api_code == 385:
-							print("Someone managed to request me, and only went private or blocked me JUST before I tweeted them back. Error 385")
-			except tweepy.TweepError as e:
-				print("Tweepy error occurred when trying to finish processing a request:{}".format(e))
-				if e.api_code == 144 or e.api_code == 63:
-					f.write(str(asker) + "\n") #Write the id to file as well in case the asker tweet still exists, but the video they replied to is the one that was deleted.
-					serviced.append(str(asker)) #If error is that status didn't exist, it was probably deleted. Fake adding it to serviced, and continue on.
-		else:
-			#sys.stdout.write('.')
-			#sys.stdout.flush() #No newline on this print
-			f.close()
-			f = open(workingDir + completedJobs, "a") #Flush to the file in case of sigkill or something else that prevents writes from actually persisting
-			try:
-				mentions = api.mentions_timeline(count=99, tweet_mode="extended")
-			except tweepy.TweepError as e:
-				print("Tweepy error occurred while in the loop's else statement:{}".format(e))
-			time.sleep(15) #Wait 15 seconds between, was 30 previously
+	try:
+		api.update_status("@" + askerName + " " + result, in_reply_to_status_id=asker)
+	except tweepy.RateLimitError as e:
+		print("Twitter api rate limit reached".format(e))
+		time.sleep(90)
+		api.update_status("@" + askerName + " " + result, in_reply_to_status_id=asker)
+	except tweepy.TweepError as e:
+		if e.api_code == 385:
+			print("Someone managed to request me, and only went private or blocked me JUST before I tweeted them back. Error 385")
 
-def someoneNeedsMe(api, mentions): #Searches for mentions, and returns a status url
-	for mention in mentions:
+#This is the main execution loop of the bot, meant to be called indefinitely
+def handleMention(api, mention, serviced):
+	unknownUsername = "UNKNOWN"
+	vidAndAsker = processMention(api, mention)
+	vid = vidAndAsker[0] #Stores whichever tweet id posted the actual video
+	asker = vidAndAsker[1] #Stores whichever tweet id asked for help
+	link = vidAndAsker[2] #Stores whether or not it was a link instead of a video
+	timestamp = vidAndAsker[3] #Stores a timestamp if one was given
+	if vid == -2:
+		print("someoneNeedsMe mention marked as done due to error proc or some other thing (this is intentional!)")
+		wrapUpJob(api, unknownUsername, asker, None, serviced)
+		return False
+
+	if vid != -1:
 		try:
-			if mention.user.screen_name == "watsongisthis":
-				return [-2, mention.id, -2, -2]
-			if hasattr(mention, "extended_entities") and mention.extended_entities["media"][0]['type'] == "video":
-				#If you are in this block, they must have posted a video and you haven't replied to them yet.
-				timestamp = getTimestamp(mention)
-				return [mention.id, mention.id, None, timestamp]
-			elif mention.in_reply_to_status_id is not None and hasattr(api.get_status(mention.in_reply_to_status_id, tweet_mode="extended"), "extended_entities") and api.get_status(mention.in_reply_to_status_id, tweet_mode="extended").extended_entities["media"][0]['type'] == "video":
-				#If you are in this block, the person they are replying to must have posted a video and you haven't replied to them yet
-				timestamp = getTimestamp(api.get_status(mention.in_reply_to_status_id, tweet_mode="extended"))
-				return [mention.in_reply_to_status_id, mention.id, None, timestamp]
-			elif len(mention.entities["urls"]) > 0:
-				#If you are in this block, the person posted a link and you haven't replied to them yet
-				timestamp = getTimestamp(mention)
-				return [mention.id, mention.id, mention.entities["urls"][0]["expanded_url"], timestamp]
-		except tweepy.RateLimitError as e:
-			print("Twitter api rate limit reached".format(e))
-			time.sleep(60)
-			continue
+			askerName = api.get_status(asker).user.screen_name
+			goodwav = downloadToGoodWav(api, vid, link, timestamp)
+			if goodwav == -1:   wrapUpJob(api, unknownUsername, asker, None, serviced)
+			elif goodwav == -2: pass #Something bad happened (at this point most likely a server side issue so try again)
+			else:
+				payload = toBase64(goodwav)
+				result = shazam(payload)
+				wrapUpJob(api, askerName, asker, result, serviced)
+				print("@" + askerName + ": " + result)
+				return True
 		except tweepy.TweepError as e:
-			print("Tweepy error occurred while in someoneNeedsMe:{}".format(e))
-			#144: Tweet was deleted
-			#63: User was banned
-			#34: Page does not exist (When does this proc vs 144???)
-			#136: You have been blocked by the author of this tweet
-			#179: You are not authorized to view status (Privated acc?)
-			#50: User not found
-			#433: User restricted who can reply to the tweet. Extremely rare, but possible even non-maliciously
+			print("Tweepy error occurred when trying to finish processing a request:{}".format(e))
+			if e.api_code == 144 or e.api_code == 63:
+				wrapUpJob(api, unknownUsername, asker, None, serviced) #If error is that status didn't exist, it was probably deleted. Fake adding it to serviced, and continue on.
+	return False
 
-			#Attempt to snatch video url even if original poster blocked us
-			if e.api_code == 136 and ((hasattr(mention, "extended_entities") and mention.extended_entities["media"][0]['type'] == "video") is False):
-				timestamp = getTimestamp(api, mention)
-				url = scrapeStatusForVideo("https://twitter.com/i/status/" + str(mention.in_reply_to_status_id))
-				if(url is None): return [-2, mention.id, -2, -2]
-				return [mention.in_reply_to_status_id, mention.id, url, timestamp]
-
-			errorCodes = [144, 63, 34, 179, 50, 433]
-			if e.api_code in errorCodes: return [-2, mention.id, -2, -2]
-			continue
-		except AttributeError as e:
-			print(e)
-			print("Triggered on Tweet: " + str(mention.id))
-			return [-2, mention.id, -2, -2] #Not sure if this job can be salvaged, so I will ditch it as a precaution.
+#For each mention, processes it to extract the data the bot needs to do its job
+def processMention(api, mention):
+	try:
+		if hasattr(mention, "extended_entities") and mention.extended_entities["media"][0]['type'] == "video":
+			#If you are in this block, they must have posted a video and you haven't replied to them yet.
+			timestamp = getTimestamp(mention)
+			return [mention.id, mention.id, None, timestamp]
+		elif mention.in_reply_to_status_id is not None and hasattr(api.get_status(mention.in_reply_to_status_id, tweet_mode="extended"), "extended_entities") and \
+			 api.get_status(mention.in_reply_to_status_id, tweet_mode="extended").extended_entities["media"][0]['type'] == "video":
+			#If you are in this block, the person they are replying to must have posted a video and you haven't replied to them yet
+			timestamp = getTimestamp(api.get_status(mention.in_reply_to_status_id, tweet_mode="extended"))
+			return [mention.in_reply_to_status_id, mention.id, None, timestamp]
+		elif len(mention.entities["urls"]) > 0:
+			#If you are in this block, the person posted a link and you haven't replied to them yet
+			timestamp = getTimestamp(mention)
+			return [mention.id, mention.id, mention.entities["urls"][0]["expanded_url"], timestamp]
+	except tweepy.RateLimitError as e:
+		print("Twitter api rate limit reached".format(e))
+		time.sleep(60)
+	except tweepy.TweepError as e:
+		errorCodes = [136, 144, 63, 34, 179, 50, 433]
+		print("Tweepy error occurred while in someoneNeedsMe:{}".format(e))
+		#Attempt to snatch video url even if original poster blocked us
+		if e.api_code == 136 and ((hasattr(mention, "extended_entities") and mention.extended_entities["media"][0]['type'] == "video") is False): return snatchVideoURL()
+		if e.api_code in errorCodes: return [-2, mention.id, -2, -2]
+	except AttributeError as e:
+		print(e)
+		print("Triggered on Tweet: " + str(mention.id))
+		return [-2, mention.id, -2, -2] #Not sure if this job can be salvaged, so I will ditch it as a precaution.
 	return [-1, -1, -1, -1]
+
+def getNewMentions(mentions, serviced):
+	return [mention for mention in mentions if str(mention.id) not in serviced and str(mention.id) + "\r" not in serviced and mention.user.screen_name != "watsongisthis"]
+
+def snatchVideoURL(mention):
+	timestamp = getTimestamp(mention)
+	url = scrapeStatusForVideo("https://twitter.com/i/status/" + str(mention.in_reply_to_status_id))
+	if(url is None): return [-2, mention.id, -2, -2]
+	return [mention.in_reply_to_status_id, mention.id, url, timestamp]
 
 def downloadToGoodWav(api, theid, url, timestamp): #Given a status id of a tweet containing an mp4, extracts the url to that mp4, downloads 4 seconds of it, converts to signed 16bit le 44,100Hz Mono wav file and returns that
 	if(url is None):
